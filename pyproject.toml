@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sea-gang"
+version = "0.1.0"
+description = "Lightweight serial task orchestrator — protects shared Ollama/Mistral resources"
+readme = "README.md"
+requires-python = ">=3.13"
+license = {text = "MIT"}
+
+dependencies = [
+    "apscheduler>=3.10",
+    "click>=8.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "textual>=0.80",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+sea-gang = "seagang.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
