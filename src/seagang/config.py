@@ -60,6 +60,7 @@ def load_project(path: Path) -> ProjectDef:
             hard_timeout_minutes=task_data.get("hard_timeout_minutes", DEFAULTS["default_hard_timeout_minutes"]),
             expected_minutes=task_data.get("expected_minutes", 15),
             schedule=task_data.get("schedule"),
+            priority=task_data.get("priority", "fast"),
         )
 
     return ProjectDef(

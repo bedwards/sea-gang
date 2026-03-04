@@ -73,6 +73,7 @@ class JobQueue:
             soft_timeout_seconds=task_def.soft_timeout_seconds,
             hard_timeout_seconds=task_def.hard_timeout_seconds,
             expected_seconds=task_def.expected_seconds,
+            priority=task_def.priority,
         )
 
         self.db.insert_job(job)

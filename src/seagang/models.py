@@ -38,6 +38,7 @@ class TaskDef:
     hard_timeout_minutes: float = 60.0
     expected_minutes: float = 15.0
     schedule: str | None = None  # cron expression
+    priority: str = "fast"  # "fast" or "slow" — fast dequeues first
 
     @property
     def soft_timeout_seconds(self) -> float:
@@ -82,6 +83,7 @@ class Job:
     soft_timeout_seconds: float = 1800.0
     hard_timeout_seconds: float = 3600.0
     expected_seconds: float = 900.0
+    priority: str = "fast"  # "fast" or "slow"
 
     @property
     def runtime_seconds(self) -> float | None:

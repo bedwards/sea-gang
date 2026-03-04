@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     soft_timeout_seconds REAL NOT NULL DEFAULT 1800,
     hard_timeout_seconds REAL NOT NULL DEFAULT 3600,
     expected_seconds REAL NOT NULL DEFAULT 900,
-    position INTEGER NOT NULL DEFAULT 0
+    position INTEGER NOT NULL DEFAULT 0,
+    priority INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -65,6 +66,10 @@ class Database:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            # Migration: add priority column if missing
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+            if "priority" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 1")
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -100,6 +105,7 @@ class Database:
             soft_timeout_seconds=row["soft_timeout_seconds"],
             hard_timeout_seconds=row["hard_timeout_seconds"],
             expected_seconds=row["expected_seconds"],
+            priority="slow" if row["priority"] == 2 else "fast",
         )
 
     # ─── Job CRUD ─────────────────────────────────────────────
@@ -115,12 +121,13 @@ class Database:
 
             conn.execute(
                 """INSERT INTO jobs (id, project, task, command, working_dir, env, status,
-                   enqueued_at, soft_timeout_seconds, hard_timeout_seconds, expected_seconds, position)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   enqueued_at, soft_timeout_seconds, hard_timeout_seconds, expected_seconds, position, priority)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job.id, job.project, job.task, job.command, job.working_dir,
                  json.dumps(job.env), job.status.value,
                  job.enqueued_at.isoformat(), job.soft_timeout_seconds,
-                 job.hard_timeout_seconds, job.expected_seconds, pos),
+                 job.hard_timeout_seconds, job.expected_seconds, pos,
+                 2 if job.priority == "slow" else 1),
             )
 
     def get_job(self, job_id: str) -> Job | None:
@@ -147,7 +154,7 @@ class Database:
         """Get all pending jobs in queue order."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'pending' ORDER BY position ASC"
+                "SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority ASC, position ASC"
             ).fetchall()
             return [self._row_to_job(r) for r in rows]
 
@@ -222,7 +229,7 @@ class Database:
         """Get the next pending job and mark it as running."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'pending' ORDER BY position ASC LIMIT 1"
+                "SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority ASC, position ASC LIMIT 1"
             ).fetchone()
             if not row:
                 return None
