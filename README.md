@@ -10,7 +10,24 @@ When multiple projects share a single local Ollama instance, concurrent LLM call
 - **Zero idle cost** — no LLM calls for orchestration itself  
 - **Smart timeouts** — soft timeout checks if the task is still producing output before killing
 - **Backpressure** — rejects new tasks when the queue gets too deep
-- **Full observability** — rich CLI, JSON output, log files, timing statistics
+- **Priority queuing** — fast tasks (healthcheck, stats) jump ahead of slow tasks (enrichment)
+- **Full observability** — rich CLI, TUI dashboard, JSON output, log files, timing statistics
+
+## Live Dashboard
+
+The Textual-based TUI gives real-time visibility into what sea-gang is doing. Here it's running a Wikipedia enrichment job — writing a deep-dive article using Ollama with `mistral-large:123b`. The queue shows 10 more enrichment jobs waiting, each processing one article at a time to avoid resource contention.
+
+![Sea-Gang TUI Dashboard](images/tui.png)
+
+The progress bar shows the current job at 217% of its expected time (4.3 minutes vs 2 minute estimate). Sea-gang doesn't kill it yet — the soft timeout system checks if the task is still producing output before deciding to terminate. The queue and history panels make it easy to see what's pending and what's already completed.
+
+## GPU Utilization
+
+While sea-gang orchestrates, the actual work happens on-device. Here's `macmon` showing the Apple M2 Ultra during an enrichment run — the GPU is at 81% utilization, pulling 84W as Mistral-large (123B parameters) generates Wikipedia-style articles from Substack content. No cloud API calls, no per-token billing — just raw local inference.
+
+![macmon GPU monitoring during enrichment](images/macmon.png)
+
+The M2 Ultra's 76-core GPU keeps the full 123B parameter model in its 192GB unified memory. CPU stays low at 13-24% — sea-gang's orchestration overhead is negligible compared to the inference workload.
 
 ## Quick Start
 
