@@ -48,7 +48,7 @@ class CurrentJobPanel(Static):
         if not job:
             self.update("[dim]No job running[/dim]")
             self.border_title = "▶ Idle"
-            self.styles.border = ("round", "grey50")
+            self.styles.border = ("round", "#808080")
             return
 
         runtime = job.runtime_seconds or 0
@@ -154,22 +154,22 @@ class SeaGangDashboard(App):
         column-span: 2;
         height: auto;
         min-height: 5;
-        border: round grey50;
+        border: round #808080;
         padding: 1;
     }
 
     #queue-table {
-        border: round grey50;
+        border: round #808080;
         border-title-color: white;
     }
 
     #history-table {
-        border: round grey50;
+        border: round #808080;
         border-title-color: white;
     }
 
     #stats-panel {
-        border: round grey50;
+        border: round #808080;
         padding: 1;
         height: auto;
         min-height: 3;
