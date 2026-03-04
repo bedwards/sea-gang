@@ -18,7 +18,7 @@ LOG_DIR = CONFIG_DIR / "logs"
 
 # Global defaults
 DEFAULTS = {
-    "max_queue_size": 10,
+    "max_queue_size": 50,
     "default_soft_timeout_minutes": 30,
     "default_hard_timeout_minutes": 60,
     "output_check_interval_seconds": 60,

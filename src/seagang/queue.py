@@ -57,7 +57,8 @@ class JobQueue:
                 f"Queue full ({depth}/{self.max_size}) — rejecting {project.name}/{task_def.name}"
             )
 
-        if self.db.has_pending_or_running(project.name, task_def.name):
+        # Duplicate detection only for fast tasks — slow tasks (e.g. enrich) can queue many
+        if task_def.priority != "slow" and self.db.has_pending_or_running(project.name, task_def.name):
             raise DuplicateJobError(
                 f"{project.name}/{task_def.name} is already pending or running"
             )
