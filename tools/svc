@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# svc — launchd service manager for humans
+# Usage: svc <command> [name]
+set -euo pipefail
+
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+DISABLED_DIR="$HOME/Library/LaunchAgents/.disabled"
+BOLD='\033[1m' DIM='\033[2m' RESET='\033[0m'
+RED='\033[31m' GREEN='\033[32m' YELLOW='\033[33m' CYAN='\033[36m' MAGENTA='\033[35m'
+UID_NUM=$(id -u)
+
+# ── Helpers ─────────────────────────────────────────────────
+
+pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null; }
+
+# Resolve a partial name to a plist path (searches active + disabled)
+resolve() {
+    local query="$1" matches=()
+    for f in "$AGENTS_DIR"/*.plist "$DISABLED_DIR"/*.plist; do
+        [ -f "$f" ] || continue
+        local label
+        label=$(pb Label "$f") || continue
+        if [[ "$label" == *"$query"* ]]; then
+            matches+=("$f")
+        fi
+    done
+    if [ ${#matches[@]} -eq 0 ]; then
+        echo "No service matching '$query'" >&2; return 1
+    elif [ ${#matches[@]} -gt 1 ]; then
+        echo "Ambiguous '$query' — matches:" >&2
+        for m in "${matches[@]}"; do pb Label "$m" >&2; done
+        return 1
+    fi
+    echo "${matches[0]}"
+}
+
+is_apple() { [[ "$1" == com.apple.* ]] || [[ "$1" == com.google.* ]] || [[ "$1" == com.valvesoftware.* ]] || [[ "$1" == com.slatedigital.* ]] || [[ "$1" == com.jetbrains.* ]]; }
+
+is_loaded() { launchctl list "$1" &>/dev/null; }
+
+get_pid() { launchctl list "$1" 2>/dev/null | awk '/PID/ {print $3}'; }
+
+get_exit() { launchctl list "$1" 2>/dev/null | awk '/LastExitStatus/ {print $3}' | tr -d ';'; }
+
+schedule_str() {
+    local f="$1"
+    local ka ral sched interval
+    ka=$(pb KeepAlive "$f" || echo "false")
+    ral=$(pb RunAtLoad "$f" || echo "false")
+    interval=$(pb StartInterval "$f" || true)
+
+    if [ "$ka" = "true" ]; then
+        echo "always (keepalive)"
+        return
+    fi
+
+    sched=$(pb StartCalendarInterval "$f" 2>/dev/null | grep -E "Hour|Minute" | paste - - | awk '{printf "%02d:%02d ",$3,$6}' 2>/dev/null || true)
+    if [ -n "$sched" ]; then
+        echo "$sched"
+        return
+    fi
+
+    if [ -n "$interval" ]; then
+        if [ "$interval" -ge 3600 ]; then
+            echo "every $((interval / 3600))h"
+        elif [ "$interval" -ge 60 ]; then
+            echo "every $((interval / 60))m"
+        else
+            echo "every ${interval}s"
+        fi
+        return
+    fi
+
+    echo "on-demand"
+}
+
+status_str() {
+    local label="$1" plist="$2"
+    local in_disabled=false
+    [[ "$plist" == */.disabled/* ]] && in_disabled=true
+
+    if $in_disabled; then
+        printf "${DIM}disabled${RESET}"
+        return
+    fi
+
+    if ! is_loaded "$label"; then
+        printf "${YELLOW}unloaded${RESET}"
+        return
+    fi
+
+    local pid
+    pid=$(get_pid "$label")
+    if [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "-" ]; then
+        printf "${GREEN}running${RESET} ${DIM}pid=$pid${RESET}"
+    else
+        local exit_code
+        exit_code=$(get_exit "$label")
+        if [ -n "$exit_code" ] && [ "$exit_code" != "0" ]; then
+            printf "${RED}exited${RESET} ${DIM}rc=$exit_code${RESET}"
+        else
+            printf "${DIM}idle${RESET}"
+        fi
+    fi
+}
+
+get_program() {
+    local f="$1"
+    # Try ProgramArguments first (array), then Program (string)
+    local prog
+    prog=$(pb "ProgramArguments:1" "$f" 2>/dev/null || pb "ProgramArguments:0" "$f" 2>/dev/null || pb Program "$f" 2>/dev/null || true)
+    echo "$prog"
+}
+
+get_log_paths() {
+    local f="$1"
+    local out err
+    out=$(pb StandardOutPath "$f" || true)
+    err=$(pb StandardErrorPath "$f" || true)
+    if [ -n "$out" ] && [ "$out" = "$err" ]; then
+        echo "$out"
+    else
+        [ -n "$out" ] && echo "out: $out"
+        [ -n "$err" ] && echo "err: $err"
+    fi
+}
+
+# Scan a script file for resource usage patterns
+scan_resources() {
+    local script="$1" plist="$2"
+    local resources=()
+
+    # Check env vars in plist for Ollama
+    local ollama_model ollama_url
+    ollama_model=$(pb "EnvironmentVariables:OLLAMA_MODEL" "$plist" 2>/dev/null || true)
+    ollama_url=$(pb "EnvironmentVariables:OLLAMA_URL" "$plist" 2>/dev/null || true)
+    if [ -n "$ollama_model" ]; then
+        resources+=("${MAGENTA}ollama${RESET}  $ollama_model ${DIM}${ollama_url:-http://127.0.0.1:11434}${RESET}")
+    fi
+
+    if [ -f "$script" ]; then
+        # Network URLs (https endpoints)
+        local domains
+        domains=$(grep -oE 'https?://[a-zA-Z0-9._/-]+' "$script" 2>/dev/null | grep -v '127.0.0.1\|localhost' | sed 's|https\?://||' | cut -d/ -f1 | sort -u || true)
+        for domain in $domains; do
+            resources+=("${CYAN}network${RESET} $domain")
+        done
+
+        # Database patterns
+        if grep -qiE 'postgres|psql|pg_' "$script" 2>/dev/null; then
+            resources+=("${YELLOW}db${RESET}      postgres")
+        fi
+        if grep -qiE 'sqlite|\.db' "$script" 2>/dev/null; then
+            resources+=("${YELLOW}db${RESET}      sqlite")
+        fi
+
+        # Docker
+        if grep -qE 'docker' "$script" 2>/dev/null; then
+            resources+=("${CYAN}docker${RESET}  containers")
+        fi
+
+        # Git push
+        if grep -qE 'git push' "$script" 2>/dev/null; then
+            resources+=("${CYAN}git${RESET}     push (publishes)")
+        fi
+    fi
+
+    for r in "${resources[@]}"; do
+        echo -e "         $r"
+    done
+}
+
+# ── Commands ────────────────────────────────────────────────
+
+cmd_ls() {
+    local show_all=false
+    [ "${1:-}" = "-a" ] && show_all=true
+
+    printf "${BOLD}%-38s %-28s %s${RESET}\n" "SERVICE" "STATUS" "SCHEDULE"
+    echo "────────────────────────────────────── ──────────────────────────────── ─────────────────────────"
+
+    for f in "$AGENTS_DIR"/*.plist "$DISABLED_DIR"/*.plist; do
+        [ -f "$f" ] || continue
+        local label
+        label=$(pb Label "$f") || continue
+        $show_all || is_apple "$label" && continue
+
+        local status schedule
+        status=$(status_str "$label" "$f")
+        schedule=$(schedule_str "$f")
+
+        printf "%-38s " "$label"
+        printf "$status"
+        # Pad to column (account for color codes)
+        local visible_len
+        visible_len=$(echo -e "$status" | sed 's/\x1b\[[0-9;]*m//g' | wc -c | tr -d ' ')
+        local pad=$((30 - visible_len))
+        [ $pad -gt 0 ] && printf "%${pad}s" ""
+        echo -e " $schedule"
+    done
+}
+
+cmd_info() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    echo -e "${BOLD}$label${RESET}"
+    echo ""
+
+    # Status
+    echo -e "  ${BOLD}status${RESET}    $(status_str "$label" "$plist")"
+    echo -e "  ${BOLD}schedule${RESET}  $(schedule_str "$plist")"
+    echo -e "  ${BOLD}run@load${RESET}  $(pb RunAtLoad "$plist" 2>/dev/null || echo "false")"
+
+    # Command
+    local prog
+    prog=$(get_program "$plist")
+    [ -n "$prog" ] && echo -e "  ${BOLD}command${RESET}   ${DIM}$prog${RESET}"
+
+    local workdir
+    workdir=$(pb WorkingDirectory "$plist" 2>/dev/null || true)
+    [ -n "$workdir" ] && echo -e "  ${BOLD}workdir${RESET}   ${DIM}$workdir${RESET}"
+
+    # Logs
+    local logs
+    logs=$(get_log_paths "$plist")
+    if [ -n "$logs" ]; then
+        echo -e "  ${BOLD}logs${RESET}      ${DIM}$logs${RESET}"
+    fi
+
+    # Plist path
+    echo -e "  ${BOLD}plist${RESET}     ${DIM}$plist${RESET}"
+
+    # Environment
+    local env_keys
+    env_keys=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$plist" 2>/dev/null | grep -E '^\s+\w' | awk '{print $1}' || true)
+    if [ -n "$env_keys" ]; then
+        echo ""
+        echo -e "  ${BOLD}env${RESET}"
+        while IFS= read -r key; do
+            local val
+            val=$(pb "EnvironmentVariables:$key" "$plist" 2>/dev/null || true)
+            # Mask obvious secrets
+            if [[ "$key" == *TOKEN* ]] || [[ "$key" == *SECRET* ]] || [[ "$key" == *API_KEY* ]]; then
+                val="${val:0:4}****"
+            fi
+            echo -e "         ${CYAN}$key${RESET}=$val"
+        done <<< "$env_keys"
+    fi
+
+    # Resources
+    local script_path
+    script_path=$(pb "ProgramArguments:1" "$plist" 2>/dev/null || pb "ProgramArguments:0" "$plist" 2>/dev/null || true)
+    local res
+    res=$(scan_resources "${script_path:-/dev/null}" "$plist")
+    if [ -n "$res" ]; then
+        echo ""
+        echo -e "  ${BOLD}resources${RESET}"
+        echo -e "$res"
+    fi
+}
+
+cmd_start() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    if [[ "$plist" == */.disabled/* ]]; then
+        echo "Service is disabled. Run 'svc enable $1' first."
+        return 1
+    fi
+
+    if is_loaded "$label"; then
+        echo "$label is already loaded"
+        return 0
+    fi
+
+    launchctl load "$plist"
+    echo -e "${GREEN}started${RESET} $label"
+
+    local ral
+    ral=$(pb RunAtLoad "$plist" 2>/dev/null || echo "false")
+    if [ "$ral" = "true" ]; then
+        echo -e "  ${DIM}(RunAtLoad=true — process launched immediately)${RESET}"
+    else
+        echo -e "  ${DIM}(loaded — will run on next scheduled trigger)${RESET}"
+    fi
+}
+
+cmd_stop() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    if ! is_loaded "$label"; then
+        echo "$label is not loaded"
+        return 0
+    fi
+
+    launchctl unload "$plist"
+    echo -e "${YELLOW}stopped${RESET} $label"
+}
+
+cmd_restart() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    is_loaded "$label" && launchctl unload "$plist"
+    sleep 1
+    launchctl load "$plist"
+    echo -e "${GREEN}restarted${RESET} $label"
+}
+
+cmd_logs() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    local out err
+    out=$(pb StandardOutPath "$plist" 2>/dev/null || true)
+    err=$(pb StandardErrorPath "$plist" 2>/dev/null || true)
+
+    local log_file=""
+    if [ -n "$out" ] && [ -f "$out" ]; then
+        log_file="$out"
+    elif [ -n "$err" ] && [ -f "$err" ]; then
+        log_file="$err"
+    fi
+
+    if [ -z "$log_file" ]; then
+        echo "No log file found for $label"
+        echo -e "${DIM}Configured paths:${RESET}"
+        [ -n "$out" ] && echo "  stdout: $out"
+        [ -n "$err" ] && echo "  stderr: $err"
+        return 1
+    fi
+
+    local lines="${2:-30}"
+    echo -e "${DIM}$log_file${RESET}"
+    echo ""
+
+    if [ "${3:-}" = "-f" ] || [ "${2:-}" = "-f" ]; then
+        tail -f "$log_file"
+    else
+        tail -n "$lines" "$log_file"
+    fi
+}
+
+cmd_disable() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    if [[ "$plist" == */.disabled/* ]]; then
+        echo "$label is already disabled"
+        return 0
+    fi
+
+    # Stop if loaded
+    is_loaded "$label" && launchctl unload "$plist"
+
+    # Move to disabled dir
+    mkdir -p "$DISABLED_DIR"
+    mv "$plist" "$DISABLED_DIR/"
+    echo -e "${YELLOW}disabled${RESET} $label"
+    echo -e "  ${DIM}plist moved to $DISABLED_DIR/${RESET}"
+    echo -e "  ${DIM}re-enable with: svc enable $1${RESET}"
+}
+
+cmd_enable() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    if [[ "$plist" != */.disabled/* ]]; then
+        echo "$label is not disabled"
+        return 0
+    fi
+
+    local basename
+    basename=$(basename "$plist")
+    mv "$plist" "$AGENTS_DIR/$basename"
+    echo -e "${GREEN}enabled${RESET} $label"
+    echo -e "  ${DIM}start with: svc start $1${RESET}"
+}
+
+cmd_nuke() {
+    local plist
+    plist=$(resolve "$1") || return 1
+    local label
+    label=$(pb Label "$plist")
+
+    echo -e "${RED}${BOLD}PERMANENTLY DELETE${RESET} $label?"
+    echo -e "  plist: $plist"
+    echo ""
+    read -rp "Type the label to confirm: " confirm
+    if [ "$confirm" != "$label" ]; then
+        echo "Aborted."
+        return 1
+    fi
+
+    # Stop if loaded
+    is_loaded "$label" && launchctl unload "$plist" 2>/dev/null || true
+
+    rm "$plist"
+    echo -e "${RED}nuked${RESET} $label"
+}
+
+cmd_start_all() {
+    echo -e "${BOLD}Loading all user services...${RESET}"
+    for f in "$AGENTS_DIR"/*.plist; do
+        [ -f "$f" ] || continue
+        local label
+        label=$(pb Label "$f") || continue
+        is_apple "$label" && continue
+
+        if is_loaded "$label"; then
+            echo -e "  ${DIM}skip${RESET}  $label (already loaded)"
+        else
+            launchctl load "$f" 2>/dev/null && \
+                echo -e "  ${GREEN}start${RESET} $label" || \
+                echo -e "  ${RED}fail${RESET}  $label"
+        fi
+    done
+}
+
+cmd_stop_all() {
+    echo -e "${BOLD}Unloading all user services...${RESET}"
+    for f in "$AGENTS_DIR"/*.plist; do
+        [ -f "$f" ] || continue
+        local label
+        label=$(pb Label "$f") || continue
+        is_apple "$label" && continue
+
+        if is_loaded "$label"; then
+            launchctl unload "$f" 2>/dev/null && \
+                echo -e "  ${YELLOW}stop${RESET}  $label" || \
+                echo -e "  ${RED}fail${RESET}  $label"
+        else
+            echo -e "  ${DIM}skip${RESET}  $label (not loaded)"
+        fi
+    done
+}
+
+# ── Main ────────────────────────────────────────────────────
+
+usage() {
+    echo -e "${BOLD}svc${RESET} — launchd service manager"
+    echo ""
+    echo -e "  ${BOLD}svc ls${RESET} [-a]              list services (${DIM}-a includes system${RESET})"
+    echo -e "  ${BOLD}svc info${RESET} <name>          detailed info + resources"
+    echo -e "  ${BOLD}svc start${RESET} <name>         load service"
+    echo -e "  ${BOLD}svc stop${RESET} <name>          unload service"
+    echo -e "  ${BOLD}svc restart${RESET} <name>       stop + start"
+    echo -e "  ${BOLD}svc logs${RESET} <name> [-f]     tail logs (${DIM}-f to follow${RESET})"
+    echo -e "  ${BOLD}svc disable${RESET} <name>       stop + shelve plist"
+    echo -e "  ${BOLD}svc enable${RESET} <name>        restore shelved plist"
+    echo -e "  ${BOLD}svc nuke${RESET} <name>          permanently delete"
+    echo -e "  ${BOLD}svc start-all${RESET}            load all user services"
+    echo -e "  ${BOLD}svc stop-all${RESET}             unload all user services"
+    echo ""
+    echo -e "  ${DIM}<name> can be a partial match: 'svc info moltbook' works${RESET}"
+}
+
+case "${1:-}" in
+    ls|list)       cmd_ls "${2:-}" ;;
+    info|show)     [ -z "${2:-}" ] && { echo "Usage: svc info <name>"; exit 1; }; cmd_info "$2" ;;
+    start)         [ -z "${2:-}" ] && { echo "Usage: svc start <name>"; exit 1; }; cmd_start "$2" ;;
+    stop)          [ -z "${2:-}" ] && { echo "Usage: svc stop <name>"; exit 1; }; cmd_stop "$2" ;;
+    restart)       [ -z "${2:-}" ] && { echo "Usage: svc restart <name>"; exit 1; }; cmd_restart "$2" ;;
+    logs|log)      [ -z "${2:-}" ] && { echo "Usage: svc logs <name> [-f]"; exit 1; }; cmd_logs "$2" "${3:-}" "${4:-}" ;;
+    disable)       [ -z "${2:-}" ] && { echo "Usage: svc disable <name>"; exit 1; }; cmd_disable "$2" ;;
+    enable)        [ -z "${2:-}" ] && { echo "Usage: svc enable <name>"; exit 1; }; cmd_enable "$2" ;;
+    nuke)          [ -z "${2:-}" ] && { echo "Usage: svc nuke <name>"; exit 1; }; cmd_nuke "$2" ;;
+    start-all)     cmd_start_all ;;
+    stop-all)      cmd_stop_all ;;
+    help|--help|-h|"") usage ;;
+    *)             echo "Unknown command: $1"; usage; exit 1 ;;
+esac
